@@ -1,0 +1,40 @@
+{
+  "name": "superreview",
+  "version": "0.1.0",
+  "description": "AI PR review loop: commit intent trailers, a deterministic reading map, and a context-free reader that gates gh pr create until the PR is self-sustaining",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "maxRounds": {
+      "type": "number",
+      "title": "Max rounds",
+      "description": "Reader rounds before the loop stops and asks the prompter",
+      "default": 3
+    },
+    "maxBodyChars": {
+      "type": "number",
+      "title": "Max body length",
+      "description": "Hard limit, in characters, for the part of the PR body the agent writes",
+      "default": 2500
+    },
+    "readerModel": {
+      "type": "string",
+      "title": "Reader model",
+      "description": "Model of the context-free reader",
+      "default": "sonnet",
+      "options": ["haiku", "sonnet", "opus"]
+    },
+    "intentModel": {
+      "type": "string",
+      "title": "Intent model",
+      "description": "Model that summarizes the human messages into the Intent trailer",
+      "default": "haiku",
+      "options": ["haiku", "sonnet"]
+    },
+    "signingKey": {
+      "type": "string",
+      "title": "Signing key",
+      "description": "SSH key file (private, or its .pub with the key in ssh-agent) that signs the marker. Empty: git's user.signingkey when gpg.format is ssh. No key: the marker is not signed",
+      "default": ""
+    }
+  }
+}

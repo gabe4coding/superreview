@@ -1,0 +1,5 @@
+# The superreview CI check and the keys it trusts. With branch protection
+# that requires code owner review, a PR that changes them needs this owner.
+/.github/superreview/ @gabe4coding
+/.github/workflows/superreview.yml @gabe4coding
+/.github/CODEOWNERS @gabe4coding
