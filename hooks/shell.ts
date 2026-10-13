@@ -191,11 +191,15 @@ function forgesIntent(cmd: string): boolean {
 
 export const MARK = /superreview:(v\d|begin|end)\b/
 export const SIGNED_FILE = /\.superreview\.md\b/
-export const CI_FILES = /\.github\/superreview\/|\.github\/workflows\/superreview\.ya?ml\b/
+// The CI check and its signers, also when reached through cd, a variable or
+// "//": the folder without its slash, the signers file by name, and the
+// workflow name after a "workflows" folder.
+export const CI_FILES =
+  /\.github\/+superreview\b|\ballowed_signers\b|\bsuperreview\/+(check|body)\.mts\b|\bworkflows\b[\s\S]*\bsuperreview\.ya?ml\b/
 export const SKIP_LABEL = 'superreview-skip'
 
 const WRITES =
-  /(?<![<>&\d-])\d*>>?(?![&>])(?!\s*\/dev\/null)|\btee\b|\b(sed|perl)\b[^|;&]*\s-[a-zA-Z]*i|\b(cp|mv|install|dd|truncate)\b|\b(python[\d.]*|node|ruby|deno|bun|php)\b|\bgit\s+(checkout|restore|apply|am|mv)\b/
+  /(?<![<>&\d-])\d*>>?(?![&>])(?!\s*\/dev\/null)|\btee\b|\b(sed|perl)\b[^|;&]*\s-[a-zA-Z]*i|\b(cp|mv|install|dd|truncate|rm|unlink|shred)\b|\b(python[\d.]*|node|ruby|deno|bun|php)\b|\bgit\s+(checkout|restore|apply|am|mv)\b/
 const NETWORK = /\b(gh\s+(pr|api)|curl|wget|http|hub)\b/
 
 // Commands that amend what superreview signed, or the check that reads it.

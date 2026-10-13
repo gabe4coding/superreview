@@ -82,6 +82,31 @@ test('classifies tampering with the marker, the signed body, the CI check and th
   for (const cmd of allowed) expect(`${classify(cmd)}: ${cmd}`).not.toBe(`tamper: ${cmd}`)
 })
 
+test('blocks changes to the signers and the check through cd, variables, "//" and rm', () => {
+  const tamper = [
+    'cd .github/superreview && echo k >> allowed_signers',
+    'cd .github && echo k >> superreview/allowed_signers',
+    'echo k >> ./.github//superreview/allowed_signers',
+    'rm .github/superreview/allowed_signers',
+    'git rm .github/superreview/allowed_signers',
+    'f=.github/superreview; echo k >> $f/allowed_signers',
+    `cd .github && sed -i 's/exit(1)/exit(0)/' superreview/check.mts`,
+    'cd .github/workflows && echo "  if: false" >> superreview.yml',
+  ]
+  for (const cmd of tamper) expect(`${classify(cmd)}: ${cmd}`).toBe(`tamper: ${cmd}`)
+
+  const allowed = [
+    'cat .github/superreview/allowed_signers',
+    'cd .github/superreview && ls',
+    'cp ci/superreview.yml /tmp/workflow-copy.yml',
+    'rm -rf node_modules',
+  ]
+  for (const cmd of allowed) expect(`${classify(cmd)}: ${cmd}`).not.toBe(`tamper: ${cmd}`)
+  expect(fileTamperReason('/r/.github/superreview/allowed_signers', ['k'])).toContain('CI check')
+  expect(fileTamperReason('/r/.github/workflows/superreview.yml', ['x'])).toContain('CI check')
+  expect(fileTamperReason('/r/ci/superreview.yml', ['x'])).toBeUndefined()
+})
+
 test('file tools: marker text, signed files and the CI check', () => {
   expect(fileTamperReason('/r/pr.md', ['ok', '<!-- superreview:begin -->'])).toContain('marker')
   expect(fileTamperReason('/r/pr.md.superreview.md', ['x'])).toContain('signed')

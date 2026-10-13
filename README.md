@@ -12,6 +12,10 @@ A Claude Code plugin that reviews the agent's pull request before a human reads 
 
 The plugin uses git's SSH signing key (`gpg.format ssh` and `user.signingkey`), or the `signingKey` option. A key that needs a touch (a FIDO key or the Secure Enclave) is the strongest choice: the agent cannot sign without a human. With a normal key, the plugin blocks the agent from signing or reading the key, but this block is best effort.
 
+## Who may change the trusted keys
+
+The plugin blocks the agent from changing `.github/superreview/` and the workflow, but a text guard cannot catch every command. The real protection is on GitHub: CI reads `allowed_signers` from the base branch, so a new key counts only after a merge. Protect the default branch (require a PR, code owner review and the `superreview` check), and put the check files under `CODEOWNERS`, as in `.github/CODEOWNERS` here.
+
 ## Layout
 
 | Path | Contents |
