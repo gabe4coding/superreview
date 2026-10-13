@@ -109,6 +109,14 @@ async function signingKey($: EngineInterface, cfg: Cfg, cwd?: string): Promise<s
   return key
 }
 
+// The private key file the guard keeps from the agent; its .pub is public.
+async function privateKeyFile($: EngineInterface, cfg: Cfg): Promise<string | undefined> {
+  return signingKey($, cfg).then(
+    k => k?.replace(/\.pub$/, ''),
+    () => undefined,
+  )
+}
+
 // Signs the marker fields with ssh-keygen -Y sign. A key that needs a touch
 // (FIDO, Secure Enclave) waits for it: the human approves each signature.
 async function sign($: EngineInterface, cfg: Cfg, cwd: string, m: MarkerFields): Promise<MarkerFields | string> {
@@ -379,10 +387,7 @@ export const register: Register = (on, options) => {
   let keyFile: string | undefined
 
   on('session.start', async ($, e, next) => {
-    keyFile = await signingKey($, cfg).then(
-      k => k?.replace(/\.pub$/, ''),
-      () => undefined,
-    )
+    keyFile = await privateKeyFile($, cfg)
     await $.command.register({
       name: 'superreview',
       description: 'Show the review loop, or dry-run the fresh reader on a PR body file',
@@ -400,6 +405,8 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     if (HUMAN.has(e.origin.kind)) {
+      // the human may have set or changed the key since the session started
+      keyFile = await privateKeyFile($, cfg)
       await update($, pending, list => {
         const all = [...list, e.text]
         while (all.length > 1 && all.join('').length > MAX_PENDING_CHARS) all.shift()
