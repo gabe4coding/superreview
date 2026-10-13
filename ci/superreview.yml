@@ -1,8 +1,9 @@
 name: superreview
 
-# pull_request_target: the workflow and the check script come from the base
-# branch, so a PR cannot change the check that judges it. The PR head is
-# fetched as git data only; nothing from it is installed or run.
+# pull_request_target: the workflow, the check script and allowed_signers come
+# from the base branch, so a PR cannot change the check that judges it or add
+# its own key. The PR head is fetched as git data only; nothing from it is
+# installed or run.
 on:
   pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
@@ -19,6 +20,14 @@ jobs:
   superreview:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # signature: a signed marker, no model call, no secret.
+      # auto: unsigned PRs go to the CI reader. reader: always the CI reader.
+      # auto and reader need the ANTHROPIC_API_KEY secret.
+      SUPERREVIEW_MODE: signature
+      SUPERREVIEW_MODEL: claude-sonnet-5-5
+      SUPERREVIEW_STRICT_HEAD: 'false'
+      SUPERREVIEW_SKIP_LABEL: superreview-skip
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,13 +41,11 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install the check's one dependency
+      - name: Install the CI reader's one dependency
+        if: env.SUPERREVIEW_MODE != 'signature'
         run: npm install --prefix .github/superreview --ignore-scripts --no-audit --no-fund
 
-      - name: Check marker and run the fresh reader
+      - name: Check the marker
         run: node --experimental-strip-types .github/superreview/check.mts
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SUPERREVIEW_MODEL: claude-sonnet-5-5
-          SUPERREVIEW_STRICT_HEAD: 'false'
-          SUPERREVIEW_SKIP_LABEL: superreview-skip
+          ANTHROPIC_API_KEY: ${{ env.SUPERREVIEW_MODE != 'signature' && secrets.ANTHROPIC_API_KEY || '' }}

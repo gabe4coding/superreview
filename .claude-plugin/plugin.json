@@ -29,6 +29,12 @@
       "description": "Model that summarizes the human messages into the Intent trailer",
       "default": "haiku",
       "options": ["haiku", "sonnet"]
+    },
+    "signingKey": {
+      "type": "string",
+      "title": "Signing key",
+      "description": "SSH key file (private, or its .pub with the key in ssh-agent) that signs the marker. Empty: git's user.signingkey when gpg.format is ssh. No key: the marker is not signed",
+      "default": ""
     }
   }
 }

@@ -52,30 +52,54 @@ export async function sha256(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-export type MarkerFields = { head: string; base: string; body: string; rounds: number; reader: string }
+// signer and sig only on a signed (v2) marker
+export type MarkerFields = { head: string; base: string; body: string; rounds: number; reader: string; signer?: string; sig?: string }
+
+// The ssh-keygen -Y namespace: a signature made for anything else does not verify here.
+export const NAMESPACE = 'superreview'
 
 export const marker = (m: MarkerFields) =>
-  `<!-- superreview:v1 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} -->`
+  m.sig === undefined
+    ? `<!-- superreview:v1 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} -->`
+    : `<!-- superreview:v2 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} signer=${m.signer} sig=${m.sig} -->`
 
-const MARKER_V1 = /^<!-- superreview:v1 head=([0-9a-f]*) base=([0-9a-f]*) body=sha256:([0-9a-f]{64}) rounds=(\d+) reader=([\w.-]+) -->\s*$/gm
+// What the signature covers, one field per line. The local loop signs it and
+// CI rebuilds it from the marker, so the two must stay byte for byte equal.
+export const signedPayload = (m: MarkerFields) =>
+  `superreview marker v2\nhead=${m.head}\nbase=${m.base}\nbody=sha256:${m.body}\nrounds=${m.rounds}\nreader=${m.reader}\nsigner=${m.signer ?? ''}\n`
 
-export type MarkerCheck = { marker?: MarkerFields; problems: string[]; notes: string[] }
+// ssh-keygen's armored signature <-> one base64 run for the marker line
+export const sigToMarker = (armored: string) =>
+  armored.replace(/-----(BEGIN|END) SSH SIGNATURE-----/g, '').replace(/\s+/g, '')
 
-// What CI holds the marker to. The hash is no signature (anyone can compute
-// it): it only shows an edit after the loop; CI's own reader is the check.
+export const sigFromMarker = (b64: string) =>
+  `-----BEGIN SSH SIGNATURE-----\n${(b64.match(/.{1,70}/g) ?? []).join('\n')}\n-----END SSH SIGNATURE-----\n`
+
+const MARKER_FIELDS =
+  /^<!-- superreview:v([12]) head=([0-9a-f]*) base=([0-9a-f]*) body=sha256:([0-9a-f]{64}) rounds=(\d+) reader=([\w.-]+)(?: signer=([^\s<>]+) sig=([A-Za-z0-9+/=]+))? -->\s*$/gm
+
+export type MarkerCheck = { marker?: MarkerFields; isSigned: boolean; problems: string[]; notes: string[] }
+
+// What CI holds the marker to, before any signature check. A v1 hash is no
+// signature (anyone can compute it): it only shows an edit after the loop. A
+// v2 marker is signed over the head too, so a later push always fails it.
 export async function verifyMarker(body: string, prHead: string, isStrictHead: boolean): Promise<MarkerCheck> {
   const text = body.replace(/\r\n/g, '\n')
-  const found = [...text.matchAll(MARKER_V1)]
+  const found = [...text.matchAll(MARKER_FIELDS)]
   const anyMarker = text.match(MARKER) ?? []
   if (found.length === 0) {
-    return { problems: ['No superreview marker: the PR skipped the local review loop (or the marker is malformed).'], notes: [] }
+    return { isSigned: false, problems: ['No superreview marker: the PR skipped the local review loop (or the marker is malformed).'], notes: [] }
   }
   if (found.length > 1 || anyMarker.length > 1) {
-    return { problems: ['More than one superreview marker in the body.'], notes: [] }
+    return { isSigned: false, problems: ['More than one superreview marker in the body.'], notes: [] }
   }
 
-  const [, head, base, hash, rounds, reader] = found[0]!
-  const m: MarkerFields = { head: head!, base: base!, body: hash!, rounds: Number(rounds), reader: reader! }
+  const [, version, head, base, hash, rounds, reader, signer, sig] = found[0]!
+  const isSigned = version === '2'
+  if (isSigned !== (sig !== undefined)) {
+    return { isSigned: false, problems: [`A v${version} marker ${isSigned ? 'without' : 'with'} a signature is malformed.`], notes: [] }
+  }
+  const m: MarkerFields = { head: head!, base: base!, body: hash!, rounds: Number(rounds), reader: reader!, signer, sig }
   const problems: string[] = []
   const notes: string[] = []
   if ((await sha256(normalize(text))) !== m.body) {
@@ -83,11 +107,11 @@ export async function verifyMarker(body: string, prHead: string, isStrictHead: b
   }
   if (m.head !== prHead) {
     const say = `Commits were pushed after the loop (marker head ${m.head.slice(0, 12) || 'none'}, PR head ${prHead.slice(0, 12)}).`
-    if (isStrictHead) problems.push(`${say} Run the loop again: \`gh pr edit --body-file <file>\`.`)
+    if (isStrictHead || isSigned) problems.push(`${say} Run the loop again: \`gh pr edit --body-file <file>\`.`)
     else notes.push(`${say} The reader below checks the current diff.`)
   }
 
-  return { marker: m, problems, notes }
+  return { marker: m, isSigned, problems, notes }
 }
 
 export const READER_SYSTEM = `You review a pull request as a human reviewer with no other context. You see only the PR title, the PR body and the diff. You do not know the conversation that produced the PR.

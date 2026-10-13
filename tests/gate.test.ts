@@ -12,10 +12,11 @@ const BODY = '## What and why\nAdd retries.\n\n## Important\nNone.\n\n## Next st
 const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
 
 // git, files, the model and Bash, faked beneath the plugin
-function world(on: On, reader: () => string) {
+function world(on: On, reader: () => string, extra: Record<string, string> = {}) {
   const files: Record<string, string> = { '/repo/pr.md': BODY }
-  const seen = { readerCalls: 0, written: '', ran: [] as string[], files }
+  const seen = { readerCalls: 0, written: '', ran: [] as string[], files, stdin: [] as string[] }
   const git: Record<string, string> = {
+    ...extra,
     pwd: '/repo\n',
     'git rev-parse --abbrev-ref HEAD': 'feat/retry\n',
     'git symbolic-ref --short refs/remotes/origin/HEAD': 'origin/main\n',
@@ -29,6 +30,7 @@ function world(on: On, reader: () => string) {
 
   on('process.run', ($, e) => {
     const key = e.argv.join(' ')
+    if (e.init?.stdin !== undefined) seen.stdin.push(e.init.stdin)
     if (key.startsWith('git log')) return { value: out('Add retries to the payment client\n') }
     return { value: key in git ? out(git[key]!) : out('', 1) }
   })
@@ -79,6 +81,30 @@ test('passes, adds its sections and the marker, and runs the rewritten command',
   expect(seen.written).toContain('## Intent\n> Add retries to the payment client')
   expect(seen.written).toContain('## Reading map')
   expect(seen.written).toMatch(/<!-- superreview:v1 head=head456 base=base123 body=sha256:[0-9a-f]{64} rounds=1 reader=sonnet -->/)
+})
+
+const SSH_SIGNING = {
+  'git config --get gpg.format': 'ssh\n',
+  'git config --get user.signingkey': '/k/id.pub\n',
+  'git config --get user.email': 'dev@example.com\n',
+}
+const SIG = '-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\nAAAA\n-----END SSH SIGNATURE-----\n'
+
+test('signs the marker with git\'s SSH signing key', async ($, on) => {
+  const seen = world(on, () => PASS, { ...SSH_SIGNING, 'ssh-keygen -Y sign -f /k/id.pub -n superreview': SIG })
+  const r = await $.tool.call({ tool: 'Bash', command: create })
+  expect(r.deny).toBeUndefined()
+  expect(seen.stdin.length).toBe(1)
+  expect(seen.stdin[0]).toContain('superreview marker v2\nhead=head456\nbase=base123\n')
+  expect(seen.stdin[0]).toContain('signer=dev@example.com\n')
+  expect(seen.written).toMatch(/<!-- superreview:v2 head=head456 base=base123 body=sha256:[0-9a-f]{64} rounds=1 reader=sonnet signer=dev@example.com sig=U1NIU0lHAAAA -->/)
+})
+
+test('a key that cannot sign stops the PR without counting a round', async ($, on) => {
+  const seen = world(on, () => PASS, SSH_SIGNING)
+  const r = await $.tool.call({ tool: 'Bash', command: create })
+  expect(r.deny).toContain('could not sign with /k/id.pub')
+  expect(seen.ran).toEqual([])
 })
 
 test('stops after max rounds and asks the prompter without another reader call', { options: { maxRounds: 1 } }, async ($, on) => {

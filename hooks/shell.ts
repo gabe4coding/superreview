@@ -208,8 +208,19 @@ export function tamperReason(cmd: string): string | undefined {
   if (CI_FILES.test(cmd) && isWrite) return 'it changes the superreview CI check'
   if (forgesIntent(cmd)) return 'it writes or rewrites an Intent trailer; superreview writes it from your messages'
   if (cmd.includes(SKIP_LABEL) && /\bgh\b/.test(bare)) return `it sets the ${SKIP_LABEL} label, which turns off the CI check`
+  if (/\bssh-keygen\b/.test(bare) && /-Y\s*["']?sign\b/.test(cmd) && cmd.includes('superreview')) {
+    return 'it signs for superreview; only the superreview loop signs its marker'
+  }
 
   return undefined
+}
+
+// The private key file by its name; the .pub beside it is public.
+export function mentionsKey(text: string, keyFile: string): boolean {
+  const name = keyFile.split('/').pop() ?? ''
+  if (name === '') return false
+
+  return new RegExp(`(?<![\\w.-])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(text)
 }
 
 // The same for the file tools, given the path and the text they write.

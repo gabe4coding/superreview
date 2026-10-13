@@ -1,8 +1,21 @@
 import { expect, test } from 'claude-code/testing'
 
-import { agentPart, composeBody, INTENT_PROMPT, marker, normalize, parseReader, readerPrompt, sha256, verifyMarker } from '../hooks/body'
+import {
+  agentPart,
+  composeBody,
+  INTENT_PROMPT,
+  marker,
+  normalize,
+  parseReader,
+  readerPrompt,
+  sha256,
+  signedPayload,
+  sigFromMarker,
+  sigToMarker,
+  verifyMarker,
+} from '../hooks/body'
 import { parseChanges, readingMap } from '../hooks/readingMap'
-import { addTrailer, classify, fileTamperReason, parseCommit, parsePr, replaceBodyFile, tamperReason } from '../hooks/shell'
+import { addTrailer, classify, fileTamperReason, mentionsKey, parseCommit, parsePr, replaceBodyFile, tamperReason } from '../hooks/shell'
 
 test('parses gh pr create with a body file after cd', () => {
   const cmd = `cd svc && gh pr create --title "Add retry" --base develop --body-file /tmp/pr.md`
@@ -103,6 +116,46 @@ test('CI marker check', async () => {
   expect(pushed.problems).toEqual([])
   expect(pushed.notes[0]).toContain('pushed after the loop')
   expect((await verifyMarker(signed, 'ccc', true)).problems[0]).toContain('pushed after the loop')
+})
+
+const ARMORED = `-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgxLPzNaYDQ0UjKQ0y2b1rn3eBFO
+cliMORrMGqTkK1vAYAAAAHZGVtby1ucwAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQy
+NTUxOQAAAECtdIQrzXtXpRu/BOLHyqNPDnkMjgHjCu+EfdeUP6tprfBfM3FqXin/3ubwyD
+bxoY/5q/Aov/LxdtQqYbba3TwI
+-----END SSH SIGNATURE-----
+`
+
+test('signed marker: the armor round trip, the payload and the v2 check', async () => {
+  const sig = sigToMarker(ARMORED)
+  expect(sig).toMatch(/^[A-Za-z0-9+/=]+$/)
+  expect(sigFromMarker(sig)).toBe(ARMORED)
+
+  const body = composeBody('## What and why\nX', 'Do X', ['**Size:** 1 files, +1 −0'])
+  const fields = { head: 'aaa', base: 'bbb', body: await sha256(normalize(body)), rounds: 1, reader: 'sonnet', signer: 'a@b.c', sig }
+  expect(signedPayload(fields)).toBe('superreview marker v2\nhead=aaa\nbase=bbb\nbody=sha256:' + fields.body + '\nrounds=1\nreader=sonnet\nsigner=a@b.c\n')
+  const signed = `${body}\n${marker(fields)}\n`
+
+  const ok = await verifyMarker(signed, 'aaa', false)
+  expect(ok.problems).toEqual([])
+  expect(ok.isSigned).toBe(true)
+  expect(ok.marker).toMatchObject({ signer: 'a@b.c', sig })
+  // a signed head is always strict: a later push needs the loop again
+  expect((await verifyMarker(signed, 'ccc', false)).problems[0]).toContain('pushed after the loop')
+  const v1WithSig = signed.replace('superreview:v2', 'superreview:v1')
+  expect((await verifyMarker(v1WithSig, 'aaa', false)).problems[0]).toContain('malformed')
+})
+
+test('blocks signing for superreview and the signing key', () => {
+  expect(classify('ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n superreview payload.txt')).toBe('tamper')
+  expect(classify('N=superreview; ssh-keygen -Ysign -f k -n "$N" < p')).toBe('tamper')
+  expect(classify('ssh-keygen -Y verify -f allowed_signers -I a@b.c -n superreview -s m.sig')).toBe('other')
+  expect(classify('ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n git commit.txt')).toBe('other')
+
+  expect(mentionsKey('cat ~/.ssh/id_ed25519', '/Users/me/.ssh/id_ed25519')).toBe(true)
+  expect(mentionsKey('base64 < "$HOME/.ssh/id_ed25519" | head', '/Users/me/.ssh/id_ed25519')).toBe(true)
+  expect(mentionsKey('cat ~/.ssh/id_ed25519.pub', '/Users/me/.ssh/id_ed25519')).toBe(false)
+  expect(mentionsKey('ls ~/.ssh/id_ed25519_work', '/Users/me/.ssh/id_ed25519')).toBe(false)
 })
 
 test('intent prompt gives earlier messages as context for a bare go-ahead', () => {

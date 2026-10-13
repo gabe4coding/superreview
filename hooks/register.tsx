@@ -9,18 +9,23 @@ import {
   LABELS,
   marker,
   MERGE_PROMPT,
+  NAMESPACE,
   normalize,
   parseReader,
   READER_SYSTEM,
   readerPrompt,
   sha256,
+  signedPayload,
+  sigToMarker,
 } from './body'
+import type { MarkerFields } from './body'
 import { parseChanges, readingMap } from './readingMap'
 import {
   addTrailer,
   classify,
   fileTamperReason,
   INTENT_LINE,
+  mentionsKey,
   parseCommit,
   parsePr,
   replaceBodyFile,
@@ -49,11 +54,11 @@ A reader with no context checks every PR body before \`gh pr create\` runs. It s
 - Use these sections: **What and why** (the change and the reason), **Important** (drift from the asked intent, breaking changes, irreversible operations, or "none"), **Next step** (the decision the reviewer must make, and what comes next), **Verify** (commands that prove the change works).
 - Keep your part under ${maxChars} characters.
 - Do not write the Intent or Reading map sections. superreview adds them from the human's messages and the diff.
-- Never write the superreview marker, an \`Intent:\` commit trailer, or a \`*.superreview.md\` file, and never edit \`.github/superreview/\`. superreview blocks these commands.
+- Never write the superreview marker, an \`Intent:\` commit trailer, or a \`*.superreview.md\` file, never edit \`.github/superreview/\`, and never sign for superreview or read its signing key. superreview blocks these commands.
 - If the check finds gaps, rewrite the body so that it is clear. Do not add an FAQ or answers at the end, and do not make it longer.
 - If the check says to ask the user, stop and ask the user. Do not retry first.`
 
-type Cfg = { maxRounds: number; maxBodyChars: number; readerModel: string; intentModel: string }
+type Cfg = { maxRounds: number; maxBodyChars: number; readerModel: string; intentModel: string; signingKey: string }
 
 type Ctx = {
   cwd: string
@@ -87,6 +92,41 @@ async function run($: EngineInterface, argv: string[], cwd?: string) {
   const r = await $.process.run(argv, cwd === undefined ? undefined : { cwd })
 
   return r.exitCode === 0 ? r.stdout : undefined
+}
+
+// The SSH key that signs the marker: the option, else git's own SSH signing
+// key. No key: the marker stays an unsigned v1 hash.
+async function signingKey($: EngineInterface, cfg: Cfg, cwd?: string): Promise<string | undefined> {
+  let key = cfg.signingKey.trim()
+  if (key === '') {
+    if ((await run($, ['git', 'config', '--get', 'gpg.format'], cwd))?.trim() !== 'ssh') return undefined
+    key = (await run($, ['git', 'config', '--get', 'user.signingkey'], cwd))?.trim() ?? ''
+  }
+  // a literal "key::ssh-ed25519 ..." names no file that ssh-keygen -f can take
+  if (key === '' || key.startsWith('key::')) return undefined
+  if (key.startsWith('~/')) key = `${(await run($, ['printenv', 'HOME']))?.trim() ?? '~'}${key.slice(1)}`
+
+  return key
+}
+
+// Signs the marker fields with ssh-keygen -Y sign. A key that needs a touch
+// (FIDO, Secure Enclave) waits for it: the human approves each signature.
+async function sign($: EngineInterface, cfg: Cfg, cwd: string, m: MarkerFields): Promise<MarkerFields | string> {
+  const key = await signingKey($, cfg, cwd)
+  if (key === undefined) return m
+  const signer = (await run($, ['git', 'config', '--get', 'user.email'], cwd))?.trim()
+  if (!signer) return 'git user.email is not set, and the signature names its signer by it'
+  const fields = { ...m, signer }
+  const r = await $.process.run(['ssh-keygen', '-Y', 'sign', '-f', key, '-n', NAMESPACE], {
+    cwd,
+    stdin: signedPayload(fields),
+    timeoutMs: 120_000,
+  }).catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
+  if (r.exitCode !== 0 || !r.stdout.includes('BEGIN SSH SIGNATURE')) {
+    return `ssh-keygen could not sign with ${key}: ${r.stderr.trim().split('\n').pop() ?? 'no output'}`
+  }
+
+  return { ...fields, sig: sigToMarker(r.stdout) }
 }
 
 async function complete($: EngineInterface, model: string, prompt: string, system?: string) {
@@ -218,13 +258,22 @@ async function gatePr($: EngineInterface, cfg: Cfg, command: string, next: (c: s
   }
 
   const hash = await sha256(normalize(checked.body))
-  const final = `${checked.body}\n${marker({ head: checked.ctx.head, base: checked.ctx.mergeBase, body: hash, rounds: round, reader: cfg.readerModel })}\n`
+  const fields = { head: checked.ctx.head, base: checked.ctx.mergeBase, body: hash, rounds: round, reader: cfg.readerModel }
+  const signed = await sign($, cfg, checked.ctx.cwd, fields)
+  if (typeof signed === 'string') {
+    await update($, loop, () => current)
+    return { deny: `superreview: the reader passed the PR, but ${signed}. No round was counted. Ask the user to fix the key (or the signingKey option), then run the same command again.` }
+  }
+  const final = `${checked.body}\n${marker(signed)}\n`
   const out = `${path}.superreview.md`
   await $.fs.write(out, final)
   const ran = await next(replaceBodyFile(command, pr.bodyFile, out))
   const isCreated = ran.deny === undefined && ran.isError !== true
   await update($, loop, () => (isCreated ? after : current))
-  if (isCreated) $.ui.toast(`superreview: the PR passed the fresh reader in ${round} round${round === 1 ? '' : 's'}`)
+  if (isCreated) {
+    const how = signed.sig === undefined ? 'not signed: no SSH signing key' : `signed as ${signed.signer}`
+    $.ui.toast(`superreview: the PR passed the fresh reader in ${round} round${round === 1 ? '' : 's'}, ${how}`)
+  }
 
   return ran
 }
@@ -274,23 +323,47 @@ const CI_INSTALL = [
   { from: 'hooks/body.ts', to: '.github/superreview/body.mts' },
 ]
 
-async function installCi($: EngineInterface): Promise<string> {
+const SIGNERS = '.github/superreview/allowed_signers'
+
+// Adds this user's public key to allowed_signers, once. CI reads the file from
+// the base branch, so a PR cannot add its own key.
+async function addSigner($: EngineInterface, cfg: Cfg, root: string): Promise<string> {
+  const key = await signingKey($, cfg, root)
+  const email = (await run($, ['git', 'config', '--get', 'user.email'], root))?.trim()
+  if (key === undefined || !email) {
+    return `No signing key: set git's SSH signing key (gpg.format ssh, user.signingkey) or the signingKey option, and user.email, then run /superreview-ci again to add it to ${SIGNERS}.`
+  }
+  const pub = String(await $.fs.read(key.endsWith('.pub') ? key : `${key}.pub`).catch(() => '')).trim()
+  if (pub === '') return `Cannot read the public key of ${key}. Add it to ${SIGNERS} by hand.`
+  const keyPart = pub.split(/\s+/).slice(0, 2).join(' ')
+  const now = String(await $.fs.read(`${root}/${SIGNERS}`).catch(() => ''))
+  if (now.includes(keyPart)) return `${SIGNERS} already has the key of ${email}.`
+  const line = `${email} namespaces="${NAMESPACE}" ${keyPart}\n`
+  await $.fs.write(`${root}/${SIGNERS}`, now === '' || now.endsWith('\n') ? `${now}${line}` : `${now}\n${line}`)
+
+  return `Added the key of ${email} to ${SIGNERS}.`
+}
+
+async function installCi($: EngineInterface, cfg: Cfg): Promise<string> {
   const root = (await run($, ['git', 'rev-parse', '--show-toplevel']))?.trim()
   if (root === undefined) return 'superreview: not in a git repository.'
   for (const f of CI_INSTALL) {
     const text = String(await $.fs.read(`${$.plugin.root}/${f.from}`))
     await $.fs.write(`${root}/${f.to}`, text.replace("from '../hooks/body.ts'", "from './body.mts'"))
   }
+  const signer = await addSigner($, cfg, root)
 
   return [
     `superreview: wrote the CI check in ${root}:`,
     ...CI_INSTALL.map(f => `- ${f.to}`),
+    signer,
     '',
     'Next steps (yours, nothing was committed):',
-    '1. Add the repository secret ANTHROPIC_API_KEY.',
+    `1. Each author adds a line to ${SIGNERS} (put it under CODEOWNERS). The check needs no secret in its default mode, "signature".`,
     '2. Merge these files to the default branch. The check runs from the base branch (pull_request_target), so it starts on PRs opened after that.',
     '3. Make "superreview" a required status check in the branch protection rules.',
     '4. To skip one PR (for example, a human PR made without the loop), a human adds the label superreview-skip.',
+    '5. Optional: SUPERREVIEW_MODE "auto" (unsigned PRs go to a CI reader) or "reader" needs the repository secret ANTHROPIC_API_KEY.',
   ].join('\n')
 }
 
@@ -300,9 +373,16 @@ export const register: Register = (on, options) => {
     maxBodyChars: Number(options.maxBodyChars ?? 2500),
     readerModel: String(options.readerModel ?? 'sonnet'),
     intentModel: String(options.intentModel ?? 'haiku'),
+    signingKey: String(options.signingKey ?? ''),
   }
+  // the private key file, kept from the agent's Bash and Read calls
+  let keyFile: string | undefined
 
   on('session.start', async ($, e, next) => {
+    keyFile = await signingKey($, cfg).then(
+      k => k?.replace(/\.pub$/, ''),
+      () => undefined,
+    )
     await $.command.register({
       name: 'superreview',
       description: 'Show the review loop, or dry-run the fresh reader on a PR body file',
@@ -316,7 +396,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'superreview-ci' }, async $ => ({ text: await installCi($) }))
+  on('command.run', { command: 'superreview-ci' }, async $ => ({ text: await installCi($, cfg) }))
 
   on('prompt.submit', async ($, e, next) => {
     if (HUMAN.has(e.origin.kind)) {
@@ -348,6 +428,9 @@ export const register: Register = (on, options) => {
     const pass = (command: string) => next({ ...e, command })
 
     if (kind === 'tamper') return { deny: `superreview: blocked, ${tamperReason(e.command)}. ${TAMPER_HINT}` }
+    if (keyFile !== undefined && mentionsKey(e.command, keyFile)) {
+      return { deny: `superreview: blocked, it uses the superreview signing key. ${TAMPER_HINT}` }
+    }
     if (kind === 'bypass') {
       return { deny: 'superreview: open or edit PRs with gh pr create/edit --body-file, so that the fresh reader can check the body.' }
     }
@@ -364,6 +447,9 @@ export const register: Register = (on, options) => {
   on('tool.call', ($, e, next) => {
     if (PR_TOOL.test(String(e.tool))) {
       return { deny: 'superreview: open PRs with gh pr create --body-file, so that the fresh reader can check the body.' }
+    }
+    if (e.tool === 'Read' && keyFile !== undefined && mentionsKey(e.file_path, keyFile)) {
+      return { deny: `superreview: blocked, it reads the superreview signing key. ${TAMPER_HINT}` }
     }
     const target =
       e.tool === 'Write'
