@@ -4,9 +4,9 @@
 //
 // 1. The marker: present, one, and the body hash matches (no edit after the loop).
 // 2. SUPERREVIEW_MODE picks what proves the loop ran:
-//    - signature (default): a v2 marker signed with a key in allowed_signers
-//      (read from the base branch) over the head, the base and the body hash.
-//      No model call, no secret.
+//    - signature (default): a marker signed with a key in allowed_signers
+//      (read from the base branch) over the patch id of the PR diff (v3; v2:
+//      the head and the base) and the body hash. No model call, no secret.
 //    - auto: a valid signature passes; an unsigned PR goes to the CI reader.
 //    - reader: a fresh reader here in CI, from the PR title, the body, the diff
 //      and the commits' Intent trailers. It needs ANTHROPIC_API_KEY.
@@ -21,6 +21,8 @@ import {
   NAMESPACE,
   normalize,
   parseReader,
+  PATCH_DIFF,
+  patchId,
   READER_SYSTEM,
   readerPrompt,
   signedPayload,
@@ -50,6 +52,18 @@ function finish(code: number): never {
 }
 
 const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+
+// The patch id of the PR diff, as the local loop computes it. HEAD is the base
+// branch tip that this workflow checked out.
+function prDiffId(head: string): string | undefined {
+  try {
+    const mergeBase = git('merge-base', 'HEAD', head).trim()
+    const diff = git(...PATCH_DIFF, mergeBase, head)
+    return patchId(execFileSync('git', ['patch-id', '--stable'], { input: diff, encoding: 'utf8' }))
+  } catch {
+    return undefined
+  }
+}
 
 // ssh-keygen checks the key against allowed_signers for this signer and namespace.
 function signatureProblem(m: MarkerFields): string | undefined {
@@ -135,7 +149,7 @@ if (pr.draft === true) {
 
 const body: string = pr.body ?? ''
 const head: string = pr.head.sha
-const check = await verifyMarker(body, head, isStrictHead, String(pr.number))
+const check = await verifyMarker(body, { head, diff: prDiffId(head), number: String(pr.number) }, isStrictHead)
 for (const n of check.notes) summary.push(`- ℹ️ ${n}`)
 if (check.problems.length > 0) {
   for (const p of check.problems) summary.push(`- ❌ ${p}`)
@@ -150,7 +164,8 @@ if (check.isSigned) {
     summary.push(`- ❌ ${problem}`)
     finish(1)
   }
-  summary.push(`- ✅ Signed by ${m.signer} for head ${m.head.slice(0, 12)}: the local loop passed this exact PR.`)
+  const what = m.diff === undefined ? `head ${m.head.slice(0, 12)}` : `diff ${m.diff.slice(0, 12)}`
+  summary.push(`- ✅ Signed by ${m.signer} for ${what}: the local loop passed this exact PR.`)
   if (mode !== 'reader') finish(0)
 } else if (mode === 'signature') {
   summary.push('- ❌ The marker is not signed. Set an SSH signing key for superreview and run the loop again, or a human adds the skip label.')

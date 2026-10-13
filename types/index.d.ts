@@ -14,8 +14,9 @@ export type Loop = {
   readingMap: string[]
 }
 
-// An open PR whose marker was made for an older head than the PR has now
-export type Stale = { pr: number; branch: string; marker: string; head: string }
+// An open PR that moved away from what its marker names: the patch id of its
+// diff (a signed marker) or its head (an unsigned one)
+export type Stale = { pr: number; branch: string; kind: 'diff' | 'head'; marker: string; now: string }
 
 declare module 'claude-code' {
   interface PluginState {

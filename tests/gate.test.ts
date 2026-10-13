@@ -1,6 +1,8 @@
 import type { On, RenderElement } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 
+import { PATCH_DIFF } from '../hooks/body'
+
 const BAND = { hasSurvey: false, isWorking: false, maxRows: 10 } as never
 
 const OK = { ok: true, gap: '' }
@@ -90,21 +92,31 @@ test('passes, adds its sections and the marker, and runs the rewritten command',
   expect(seen.written).toMatch(/<!-- superreview:v1 head=head456 base=base123 body=sha256:[0-9a-f]{64} rounds=1 reader=sonnet -->/)
 })
 
+// the patch id of the PR diff, from the same git diff CI runs
+const DIFF_ID = 'd'.repeat(40)
+const PATCH = (base: string, id: string) => ({
+  [`git ${PATCH_DIFF.join(' ')} ${base} HEAD`]: 'diff --git a/src/client.ts b/src/client.ts\n+retry()\n',
+  'git patch-id --stable': `${id} ${'0'.repeat(40)}\n`,
+})
 const SSH_SIGNING = {
   'git config --get gpg.format': 'ssh\n',
   'git config --get user.signingkey': '/k/id.pub\n',
   'git config --get user.email': 'dev@example.com\n',
+  ...PATCH('base123', DIFF_ID),
 }
 const SIG = '-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\nAAAA\n-----END SSH SIGNATURE-----\n'
 
-test('signs the marker with git\'s SSH signing key', async ($, on) => {
+test('signs the diff with git\'s SSH signing key', async ($, on) => {
   const seen = world(on, () => PASS, { ...SSH_SIGNING, 'ssh-keygen -Y sign -f /k/id.pub -n superreview': SIG })
   const r = await $.tool.call({ tool: 'Bash', command: create })
   expect(r.deny).toBeUndefined()
-  expect(seen.stdin.length).toBe(1)
-  expect(seen.stdin[0]).toContain('superreview marker v2\nhead=head456\nbase=base123\n')
-  expect(seen.stdin[0]).toContain('signer=dev@example.com\n')
-  expect(seen.written).toMatch(/<!-- superreview:v2 head=head456 base=base123 body=sha256:[0-9a-f]{64} rounds=1 reader=sonnet signer=dev@example.com sig=U1NIU0lHAAAA -->/)
+  const payload = seen.stdin.filter(s => s.startsWith('superreview marker'))
+  expect(payload.length).toBe(1)
+  expect(payload[0]).toContain(`superreview marker v3\ndiff=${DIFF_ID}\nbody=sha256:`)
+  expect(payload[0]).toContain('signer=dev@example.com\n')
+  expect(seen.written).toMatch(
+    new RegExp(`<!-- superreview:v3 diff=${DIFF_ID} body=sha256:[0-9a-f]{64} rounds=1 reader=sonnet signer=dev@example.com sig=U1NIU0lHAAAA -->`),
+  )
 })
 
 test('a key that cannot sign stops the PR without counting a round', async ($, on) => {
@@ -167,14 +179,12 @@ test('an amend that replaces the message keeps the old Intent trailer', async ($
   expect(seen.ran[1]).toBe('git commit -m "no messages yet"')
 })
 
-const MARKED = (head: string) =>
-  JSON.stringify({
-    number: 7,
-    headRefName: 'feat/retry',
-    headRefOid: 'aaa111',
-    body: `x\n<!-- superreview:v1 head=${head} base=bbb222 body=sha256:${'0'.repeat(64)} rounds=1 reader=sonnet -->\n`,
-  })
-const VIEW = 'gh pr view --json number,body,headRefName,headRefOid'
+const HASH = `sha256:${'0'.repeat(64)}`
+const view = (marker: string) =>
+  JSON.stringify({ number: 7, baseRefName: 'main', headRefName: 'feat/retry', headRefOid: 'aaa111', body: `x\n${marker}\n` })
+const MARKED = (head: string) => view(`<!-- superreview:v1 head=${head} base=bbb222 body=${HASH} rounds=1 reader=sonnet -->`)
+const SIGNED = view(`<!-- superreview:v3 diff=${DIFF_ID} body=${HASH} rounds=1 reader=sonnet signer=dev@example.com sig=U1NIU0lH -->`)
+const VIEW = 'gh pr view --json number,body,baseRefName,headRefName,headRefOid'
 // marker heads are hex
 const PUSHED = { 'git rev-parse HEAD': 'ccc333\n' }
 
@@ -197,10 +207,28 @@ test('a push that keeps the marked head adds nothing', async ($, on) => {
   await ui.unmount()
 })
 
+const REBASED = { ...PUSHED, 'git merge-base origin/main HEAD': 'bbb222\n' }
+
+test('a push after a clean rebase keeps a signed diff and adds nothing', async ($, on) => {
+  world(on, () => PASS, { ...REBASED, ...PATCH('bbb222', DIFF_ID), [VIEW]: SIGNED })
+  await $.tool.call({ tool: 'Bash', command: 'git push --force-with-lease' })
+  const ui = await $.ui.mount({ plugin: 'superreview', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ type: 'Text', text: /PR #7/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a push that changes a signed diff says the diff changed', async ($, on) => {
+  world(on, () => PASS, { ...REBASED, ...PATCH('bbb222', 'e'.repeat(40)), [VIEW]: SIGNED })
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  const ui = await $.ui.mount({ plugin: 'superreview', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ type: 'Text', text: /PR #7: the diff changed since the loop\. Run gh pr edit 7/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('the body says which head superreview checked', async ($, on) => {
   const seen = world(on, () => PASS)
   await $.tool.call({ tool: 'Bash', command: create })
-  expect(seen.written).toContain('checked this body for head `head456`')
+  expect(seen.written).toContain('against the diff at head `head456`')
 })
 
 test('a commit message file with an Intent line is refused', async ($, on) => {

@@ -23,15 +23,15 @@ export function agentPart(body: string): string {
   return text.replace(MARKER, '').trim()
 }
 
-// The head line tells a human reader, before CI does, that a push or a rebase
-// makes the marker out of date.
+// The head line tells a human reader, before CI does, when the marker goes
+// out of date.
 export function composeBody(agent: string, intent: string, map: string[], head?: string): string {
   const headLine =
     head === undefined
       ? []
       : [
           '',
-          `<sub>superreview checked this body for head \`${head.slice(0, 7)}\`. A push or a rebase changes the head: then run \`gh pr edit --body-file <file>\` again, or the superreview check fails.</sub>`,
+          `<sub>superreview checked this body against the diff at head \`${head.slice(0, 7)}\`. A change to the diff (a new commit, a conflict fix, or a rebase onto changes next to these lines) needs \`gh pr edit --body-file <file>\` again, or the superreview check fails. With a signed marker, other rebases need nothing.</sub>`,
         ]
 
   return [
@@ -63,8 +63,37 @@ export async function sha256(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
-// signer and sig only on a signed (v2) marker
-export type MarkerFields = { head: string; base: string; body: string; rounds: number; reader: string; signer?: string; sig?: string }
+// The git diff whose patch id a signed (v3) marker names. git patch-id
+// --stable leaves out line numbers and whitespace, so a clean rebase keeps the
+// id. The local loop and CI pass the same flags, so the user's git config
+// (prefixes, diff algorithm, external diff) cannot change the id.
+export const PATCH_DIFF = [
+  'diff',
+  '--no-color',
+  '--no-ext-diff',
+  '--no-textconv',
+  '--no-relative',
+  '--diff-algorithm=myers',
+  '--src-prefix=a/',
+  '--dst-prefix=b/',
+  '-M',
+]
+
+// git patch-id prints "<id> <commit>"; an empty diff prints nothing.
+export const patchId = (out: string) => out.trim().split(/\s+/)[0] || undefined
+
+// v1: unsigned, over the head. v2: signed, over the head (older PRs).
+// v3: signed, over the patch id of the diff in place of the head and the base.
+export type MarkerFields = {
+  head: string
+  base: string
+  body: string
+  rounds: number
+  reader: string
+  signer?: string
+  sig?: string
+  diff?: string
+}
 
 // The ssh-keygen -Y namespace: a signature made for anything else does not verify here.
 export const NAMESPACE = 'superreview'
@@ -72,12 +101,16 @@ export const NAMESPACE = 'superreview'
 export const marker = (m: MarkerFields) =>
   m.sig === undefined
     ? `<!-- superreview:v1 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} -->`
-    : `<!-- superreview:v2 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} signer=${m.signer} sig=${m.sig} -->`
+    : m.diff === undefined
+      ? `<!-- superreview:v2 head=${m.head} base=${m.base} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} signer=${m.signer} sig=${m.sig} -->`
+      : `<!-- superreview:v3 diff=${m.diff} body=sha256:${m.body} rounds=${m.rounds} reader=${m.reader} signer=${m.signer} sig=${m.sig} -->`
 
 // What the signature covers, one field per line. The local loop signs it and
 // CI rebuilds it from the marker, so the two must stay byte for byte equal.
 export const signedPayload = (m: MarkerFields) =>
-  `superreview marker v2\nhead=${m.head}\nbase=${m.base}\nbody=sha256:${m.body}\nrounds=${m.rounds}\nreader=${m.reader}\nsigner=${m.signer ?? ''}\n`
+  m.diff === undefined
+    ? `superreview marker v2\nhead=${m.head}\nbase=${m.base}\nbody=sha256:${m.body}\nrounds=${m.rounds}\nreader=${m.reader}\nsigner=${m.signer ?? ''}\n`
+    : `superreview marker v3\ndiff=${m.diff}\nbody=sha256:${m.body}\nrounds=${m.rounds}\nreader=${m.reader}\nsigner=${m.signer ?? ''}\n`
 
 // ssh-keygen's armored signature <-> one base64 run for the marker line
 export const sigToMarker = (armored: string) =>
@@ -89,21 +122,43 @@ export const sigFromMarker = (b64: string) =>
 const MARKER_FIELDS =
   /^<!-- superreview:v([12]) head=([0-9a-f]*) base=([0-9a-f]*) body=sha256:([0-9a-f]{64}) rounds=(\d+) reader=([\w.-]+)(?: signer=([^\s<>]+) sig=([A-Za-z0-9+/=]+))? -->\s*$/gm
 
-// The head the marker was made for, when the body has exactly one marker.
-export function markerHead(body: string): string | undefined {
-  const found = [...body.replace(/\r\n/g, '\n').matchAll(MARKER_FIELDS)]
+const MARKER_V3 =
+  /^<!-- superreview:v3 diff=([0-9a-f]{40,64}) body=sha256:([0-9a-f]{64}) rounds=(\d+) reader=([\w.-]+) signer=([^\s<>]+) sig=([A-Za-z0-9+/=]+) -->\s*$/gm
 
-  return found.length === 1 ? found[0]![2] : undefined
+type Parsed = { version: 1 | 2 | 3; m: MarkerFields }
+
+function parseMarkers(text: string): Parsed[] {
+  const older = [...text.matchAll(MARKER_FIELDS)].map(([, v, head, base, body, rounds, reader, signer, sig]) => ({
+    version: v === '2' ? (2 as const) : (1 as const),
+    m: { head: head!, base: base!, body: body!, rounds: Number(rounds), reader: reader!, signer, sig },
+  }))
+  const v3 = [...text.matchAll(MARKER_V3)].map(([, diff, body, rounds, reader, signer, sig]) => ({
+    version: 3 as const,
+    m: { head: '', base: '', body: body!, rounds: Number(rounds), reader: reader!, signer, sig, diff },
+  }))
+
+  return [...older, ...v3]
 }
 
-export type MarkerCheck ={ marker?: MarkerFields; isSigned: boolean; problems: string[]; notes: string[] }
+// The marker, when the body has exactly one.
+export function readMarker(body: string): MarkerFields | undefined {
+  const found = parseMarkers(body.replace(/\r\n/g, '\n'))
+
+  return found.length === 1 ? found[0]!.m : undefined
+}
+
+// The PR as CI sees it: its head, the patch id of its diff, its number.
+export type PrState = { head: string; diff?: string; number?: string }
+
+export type MarkerCheck = { marker?: MarkerFields; isSigned: boolean; problems: string[]; notes: string[] }
 
 // What CI holds the marker to, before any signature check. A v1 hash is no
 // signature (anyone can compute it): it only shows an edit after the loop. A
-// v2 marker is signed over the head too, so a later push always fails it.
-export async function verifyMarker(body: string, prHead: string, isStrictHead: boolean, prNumber = '<number>'): Promise<MarkerCheck> {
+// v2 marker is signed over the head, so a later push always fails it. A v3
+// marker is signed over the diff, so only a push that changes the diff fails it.
+export async function verifyMarker(body: string, pr: PrState, isStrictHead: boolean): Promise<MarkerCheck> {
   const text = body.replace(/\r\n/g, '\n')
-  const found = [...text.matchAll(MARKER_FIELDS)]
+  const found = parseMarkers(text)
   const anyMarker = text.match(MARKER) ?? []
   if (found.length === 0) {
     return { isSigned: false, problems: ['No superreview marker: the PR skipped the local review loop (or the marker is malformed).'], notes: [] }
@@ -112,24 +167,26 @@ export async function verifyMarker(body: string, prHead: string, isStrictHead: b
     return { isSigned: false, problems: ['More than one superreview marker in the body.'], notes: [] }
   }
 
-  const [, version, head, base, hash, rounds, reader, signer, sig] = found[0]!
-  const isSigned = version === '2'
-  if (isSigned !== (sig !== undefined)) {
+  const { version, m } = found[0]!
+  const isSigned = version !== 1
+  if (isSigned !== (m.sig !== undefined)) {
     return { isSigned: false, problems: [`A v${version} marker ${isSigned ? 'without' : 'with'} a signature is malformed.`], notes: [] }
   }
-  const m: MarkerFields = { head: head!, base: base!, body: hash!, rounds: Number(rounds), reader: reader!, signer, sig }
+  const again = `In Claude Code, run the loop again: \`gh pr edit ${pr.number ?? '<number>'} --body-file <file>\`. The same body is fine if it still describes the diff.`
   const problems: string[] = []
   const notes: string[] = []
   if ((await sha256(normalize(text))) !== m.body) {
     problems.push('The body changed after the review loop (hash mismatch). Change it through superreview: `gh pr edit --body-file <file>`.')
   }
-  if (m.head !== prHead) {
-    const say = `The PR head changed after the loop, by a push or a rebase (marker head ${m.head.slice(0, 12) || 'none'}, PR head ${prHead.slice(0, 12)}).`
-    if (isStrictHead || isSigned) {
+  if (m.diff !== undefined) {
+    if (pr.diff !== m.diff) {
       problems.push(
-        `${say} The marker is good for one head only. In Claude Code, run the loop again: \`gh pr edit ${prNumber} --body-file <file>\`. The same body is fine if it still describes the diff.`,
+        `The PR diff changed after the loop: a new commit, a conflict fix, or a rebase onto changes next to the PR's own lines (marker diff ${m.diff.slice(0, 12)}, PR diff ${pr.diff?.slice(0, 12) ?? 'unknown'}). A rebase that does not touch those lines keeps the diff; this change needs a new review. ${again}`,
       )
     }
+  } else if (m.head !== pr.head) {
+    const say = `The PR head changed after the loop, by a push or a rebase (marker head ${m.head.slice(0, 12) || 'none'}, PR head ${pr.head.slice(0, 12)}).`
+    if (isStrictHead || isSigned) problems.push(`${say} This marker is good for one head only. ${again}`)
     else notes.push(`${say} The reader below checks the current diff.`)
   }
 
