@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { agentPart, composeBody, marker, normalize, parseReader, readerPrompt, sha256, verifyMarker } from '../hooks/body'
+import { agentPart, composeBody, INTENT_PROMPT, marker, normalize, parseReader, readerPrompt, sha256, verifyMarker } from '../hooks/body'
 import { parseChanges, readingMap } from '../hooks/readingMap'
 import { addTrailer, classify, fileTamperReason, parseCommit, parsePr, replaceBodyFile, tamperReason } from '../hooks/shell'
 
@@ -103,6 +103,13 @@ test('CI marker check', async () => {
   expect(pushed.problems).toEqual([])
   expect(pushed.notes[0]).toContain('pushed after the loop')
   expect((await verifyMarker(signed, 'ccc', true)).problems[0]).toContain('pushed after the loop')
+})
+
+test('intent prompt gives earlier messages as context for a bare go-ahead', () => {
+  const p = INTENT_PROMPT(['ok go'], ['Add a CI check'])
+  expect(p).toContain('<earlier>\n<message>\nAdd a CI check\n</message>\n</earlier>')
+  expect(p.indexOf('<earlier>')).toBeLessThan(p.indexOf('<message n="1">\nok go'))
+  expect(INTENT_PROMPT(['Add a CI check'])).not.toContain('<earlier>')
 })
 
 test('reader prompt carries the commit intents for CI', () => {

@@ -151,16 +151,28 @@ export function parseReader(text: string): ItemResult[] | undefined {
   })
 }
 
-export const INTENT_PROMPT = (messages: string[]) =>
-  `These are the messages a human wrote to a coding agent since the last commit, oldest first.
+export const INTENT_PROMPT = (messages: string[], earlier: string[] = []) => {
+  const context =
+    earlier.length === 0
+      ? ''
+      : `Earlier messages of the same session, already used for earlier commits. Use them only to understand the new messages:
+
+<earlier>
+${earlier.map(m => `<message>\n${m}\n</message>`).join('\n')}
+</earlier>
+
+`
+
+  return `${context}These are the messages a human wrote to a coding agent since the last commit, oldest first.
 
 ${messages.map((m, i) => `<message n="${i + 1}">\n${m}\n</message>`).join('\n')}
 
-Write the human's intent for this work in one sentence of at most 200 characters. Use only what the human said; later corrections win over earlier asks. Do not describe the implementation. Reply with the sentence only.`
+Write the human's intent for this work in one sentence of at most 200 characters. Use only what the human said; later corrections win over earlier asks. When the new messages only approve or continue ("ok go", "yes"), state the task they approve, from the earlier messages. Do not describe the implementation. Reply with the sentence only.`
+}
 
 export const MERGE_PROMPT = (intents: string[]) =>
   `These are the intent lines of the commits of one pull request, oldest first. Each one was summarized from a human's own messages.
 
 ${intents.map(i => `- ${i}`).join('\n')}
 
-Merge them into one intent of at most 300 characters. Keep only what they say. Reply with the intent only.`
+Merge them into one intent of at most 300 characters. Keep only what they say. Ignore a line that names no task, such as a bare go-ahead. Reply with the intent only.`

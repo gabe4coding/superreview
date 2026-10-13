@@ -16,6 +16,6 @@ export type Loop = {
 
 declare module 'claude-code' {
   interface PluginState {
-    superreview: { pending: string[]; loop: Loop | null }
+    superreview: { pending: string[]; history: string[]; loop: Loop | null }
   }
 }

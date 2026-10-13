@@ -29,10 +29,13 @@ import {
 import type { PrCommand } from './shell'
 
 const pending = atom({ plugin: 'superreview', key: 'pending' } as const, [])
+// messages already used by a commit: context for a short "ok go" later
+const history = atom({ plugin: 'superreview', key: 'history' } as const, [])
 const loop = atom({ plugin: 'superreview', key: 'loop' } as const, null)
 
 const HUMAN = new Set(['composer', 'bridge', 'sdk'])
 const MAX_PENDING_CHARS = 12_000
+const MAX_HISTORY = 20
 const PR_TOOL = /(create|update)_pull_request|pull_request_(create|update)/i
 const GUARDED_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit'])
 const TAMPER_HINT =
@@ -142,7 +145,7 @@ async function prIntent($: EngineInterface, cfg: Cfg, ctx: Ctx): Promise<string>
   }
   const messages = await read($, pending)
   if (messages.length > 0) {
-    const summary = await complete($, cfg.intentModel, INTENT_PROMPT(messages))
+    const summary = await complete($, cfg.intentModel, INTENT_PROMPT(messages, await read($, history)))
     if (summary) return oneLine(summary, 300)
   }
 
@@ -226,8 +229,9 @@ async function gatePr($: EngineInterface, cfg: Cfg, command: string, next: (c: s
   return ran
 }
 
-// Intent trailer from the human's own messages since the last commit. An
-// amend that replaces the message would drop the old trailer: keep it.
+// Intent trailer from the human's own messages since the last commit, with
+// the earlier ones as context. An amend that replaces the message would drop
+// the old trailer: keep it.
 async function addIntent($: EngineInterface, cfg: Cfg, command: string, next: (c: string) => Promise<Ran>): Promise<Ran> {
   const commit = parseCommit(command)
   if (commit === undefined) return next(command)
@@ -247,7 +251,7 @@ async function addIntent($: EngineInterface, cfg: Cfg, command: string, next: (c
       : undefined
   let fresh: string | undefined
   if (messages.length > 0) {
-    fresh = await complete($, cfg.intentModel, INTENT_PROMPT(messages))
+    fresh = await complete($, cfg.intentModel, INTENT_PROMPT(messages, await read($, history)))
     if (fresh === undefined) $.ui.status('superreview: no new intent (the model did not answer)')
   }
   const parts = [kept, fresh === undefined ? undefined : oneLine(fresh, 200)].filter((p): p is string => !!p)
@@ -255,7 +259,10 @@ async function addIntent($: EngineInterface, cfg: Cfg, command: string, next: (c
   const merged = parts.length === 1 ? parts[0] : await complete($, cfg.intentModel, MERGE_PROMPT(parts))
 
   const ran = await next(addTrailer(command, commit, oneLine(merged ?? parts.join(' '), 200)))
-  if (ran.deny === undefined && ran.isError !== true) await update($, pending, () => [])
+  if (ran.deny === undefined && ran.isError !== true) {
+    await update($, history, h => [...h, ...messages].slice(-MAX_HISTORY))
+    await update($, pending, () => [])
+  }
 
   return ran
 }
