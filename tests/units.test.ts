@@ -156,6 +156,9 @@ test('blocks signing for superreview and the signing key', () => {
   expect(mentionsKey('base64 < "$HOME/.ssh/id_ed25519" | head', '/Users/me/.ssh/id_ed25519')).toBe(true)
   expect(mentionsKey('cat ~/.ssh/id_ed25519.pub', '/Users/me/.ssh/id_ed25519')).toBe(false)
   expect(mentionsKey('ls ~/.ssh/id_ed25519_work', '/Users/me/.ssh/id_ed25519')).toBe(false)
+  // a key named like the repo: the repo path is not the key
+  expect(mentionsKey('git -C /Users/me/Repositories/superreview status', '/Users/me/.ssh/superreview')).toBe(false)
+  expect(mentionsKey('cat ~/.ssh/superreview', '/Users/me/.ssh/superreview')).toBe(true)
 })
 
 test('intent prompt gives earlier messages as context for a bare go-ahead', () => {

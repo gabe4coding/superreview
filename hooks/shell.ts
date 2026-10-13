@@ -215,12 +215,14 @@ export function tamperReason(cmd: string): string | undefined {
   return undefined
 }
 
-// The private key file by its name; the .pub beside it is public.
+// The private key file by its folder and name (".ssh/id_ed25519"): the name
+// alone can be a common word, such as a repo named like the key. The .pub
+// beside it is public.
 export function mentionsKey(text: string, keyFile: string): boolean {
-  const name = keyFile.split('/').pop() ?? ''
-  if (name === '') return false
+  const tail = keyFile.split('/').filter(Boolean).slice(-2).join('/')
+  if (tail === '') return false
 
-  return new RegExp(`(?<![\\w.-])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(text)
+  return new RegExp(`(?<![\\w.-])${tail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.-])`).test(text)
 }
 
 // The same for the file tools, given the path and the text they write.
