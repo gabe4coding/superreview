@@ -29,9 +29,12 @@ jobs:
       SUPERREVIEW_STRICT_HEAD: 'false'
       SUPERREVIEW_SKIP_LABEL: superreview-skip
     steps:
+      # github.sha is the base branch tip, where this workflow file comes from.
+      # pull_request.base.sha can be older: GitHub does not move it when the
+      # base branch moves, so it can miss the check files.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Fetch the PR head as data
