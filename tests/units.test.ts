@@ -5,10 +5,11 @@ import {
   composeBody,
   INTENT_PROMPT,
   marker,
-  markerHead,
   normalize,
   parseReader,
+  patchId,
   readerPrompt,
+  readMarker,
   sha256,
   signedPayload,
   sigFromMarker,
@@ -130,29 +131,29 @@ test('CI marker check', async () => {
   const hash = await sha256(normalize(body))
   const signed = `${body}\n${marker({ head: 'aaa', base: 'bbb', body: hash, rounds: 2, reader: 'sonnet' })}\n`
 
-  const ok = await verifyMarker(signed.replace(/\n/g, '\r\n'), 'aaa', true)
+  const ok = await verifyMarker(signed.replace(/\n/g, '\r\n'), { head: 'aaa' }, true)
   expect(ok.problems).toEqual([])
   expect(ok.marker?.rounds).toBe(2)
 
-  expect((await verifyMarker(body, 'aaa', false)).problems[0]).toContain('No superreview marker')
-  expect((await verifyMarker(signed.replace('Do X', 'Do Y'), 'aaa', false)).problems[0]).toContain('hash mismatch')
-  expect((await verifyMarker(`${signed}${signed}`, 'aaa', false)).problems[0]).toContain('More than one')
+  expect((await verifyMarker(body, { head: 'aaa' }, false)).problems[0]).toContain('No superreview marker')
+  expect((await verifyMarker(signed.replace('Do X', 'Do Y'), { head: 'aaa' }, false)).problems[0]).toContain('hash mismatch')
+  expect((await verifyMarker(`${signed}${signed}`, { head: 'aaa' }, false)).problems[0]).toContain('More than one')
 
-  const pushed = await verifyMarker(signed, 'ccc', false)
+  const pushed = await verifyMarker(signed, { head: 'ccc' }, false)
   expect(pushed.problems).toEqual([])
   expect(pushed.notes[0]).toContain('a push or a rebase')
-  const strict = (await verifyMarker(signed, 'ccc', true, '7')).problems[0]
+  const strict = (await verifyMarker(signed, { head: 'ccc', number: '7' }, true)).problems[0]
   expect(strict).toContain('a push or a rebase')
   expect(strict).toContain('gh pr edit 7 --body-file')
 })
 
 test('the body names its head, and the marker gives it back', async () => {
   const body = composeBody('## What and why\nX', 'Do X', ['**Size:** 1 files, +1 −0'], 'abcdef0123')
-  expect(body).toContain('checked this body for head `abcdef0`')
+  expect(body).toContain('against the diff at head `abcdef0`')
   expect(agentPart(body)).toBe('## What and why\nX')
   const hash = await sha256(normalize(body))
-  expect(markerHead(`${body}\n${marker({ head: 'abcdef0123', base: 'b', body: hash, rounds: 1, reader: 'sonnet' })}\n`)).toBe('abcdef0123')
-  expect(markerHead(body)).toBeUndefined()
+  expect(readMarker(`${body}\n${marker({ head: 'abcdef0123', base: 'b', body: hash, rounds: 1, reader: 'sonnet' })}\n`)?.head).toBe('abcdef0123')
+  expect(readMarker(body)).toBeUndefined()
   expect(parsePush('git push --force-with-lease')).toEqual({ cwd: undefined })
   expect(parsePush('cd svc && git push')).toEqual({ cwd: 'svc' })
   expect(parsePush('git -C r push origin x')).toEqual({ cwd: 'r' })
@@ -177,14 +178,37 @@ test('signed marker: the armor round trip, the payload and the v2 check', async 
   expect(signedPayload(fields)).toBe('superreview marker v2\nhead=aaa\nbase=bbb\nbody=sha256:' + fields.body + '\nrounds=1\nreader=sonnet\nsigner=a@b.c\n')
   const signed = `${body}\n${marker(fields)}\n`
 
-  const ok = await verifyMarker(signed, 'aaa', false)
+  const ok = await verifyMarker(signed, { head: 'aaa' }, false)
   expect(ok.problems).toEqual([])
   expect(ok.isSigned).toBe(true)
   expect(ok.marker).toMatchObject({ signer: 'a@b.c', sig })
   // a signed head is always strict: a later push needs the loop again
-  expect((await verifyMarker(signed, 'ccc', false)).problems[0]).toContain('a push or a rebase')
+  expect((await verifyMarker(signed, { head: 'ccc' }, false)).problems[0]).toContain('a push or a rebase')
   const v1WithSig = signed.replace('superreview:v2', 'superreview:v1')
-  expect((await verifyMarker(v1WithSig, 'aaa', false)).problems[0]).toContain('malformed')
+  expect((await verifyMarker(v1WithSig, { head: 'aaa' }, false)).problems[0]).toContain('malformed')
+})
+
+test('a v3 marker signs the diff: a new head with the same diff passes', async () => {
+  const sig = sigToMarker(ARMORED)
+  const diff = 'd'.repeat(40)
+  const body = composeBody('## What and why\nX', 'Do X', ['**Size:** 1 files, +1 −0'], 'aaa')
+  const fields = { head: 'aaa', base: 'bbb', body: await sha256(normalize(body)), rounds: 1, reader: 'sonnet', signer: 'a@b.c', sig, diff }
+  expect(signedPayload(fields)).toBe(`superreview marker v3\ndiff=${diff}\nbody=sha256:${fields.body}\nrounds=1\nreader=sonnet\nsigner=a@b.c\n`)
+  const signed = `${body}\n${marker(fields)}\n`
+  expect(marker(fields)).not.toContain('head=')
+  expect(readMarker(signed)).toMatchObject({ diff, signer: 'a@b.c', sig })
+
+  // a clean rebase: new head, same diff
+  const rebased = await verifyMarker(signed, { head: 'ccc', diff }, false)
+  expect(rebased.problems).toEqual([])
+  expect(rebased.isSigned).toBe(true)
+  // a new commit or a conflict fix: the diff changed
+  const changed = (await verifyMarker(signed, { head: 'ccc', diff: 'e'.repeat(40), number: '9' }, false)).problems[0]
+  expect(changed).toContain('The PR diff changed after the loop')
+  expect(changed).toContain('gh pr edit 9 --body-file')
+  expect((await verifyMarker(signed, { head: 'ccc' }, false)).problems[0]).toContain('PR diff unknown')
+  expect(patchId('f00d 0000000000000000000000000000000000000000\n')).toBe('f00d')
+  expect(patchId('')).toBeUndefined()
 })
 
 test('blocks signing for superreview and the signing key', () => {

@@ -8,11 +8,13 @@ import {
   INTENT_PROMPT,
   LABELS,
   marker,
-  markerHead,
   MERGE_PROMPT,
   NAMESPACE,
   normalize,
   parseReader,
+  PATCH_DIFF,
+  patchId,
+  readMarker,
   READER_SYSTEM,
   readerPrompt,
   sha256,
@@ -58,7 +60,7 @@ A reader with no context checks every PR body before \`gh pr create\` runs. It s
 - Keep your part under ${maxChars} characters.
 - Do not write the Intent or Reading map sections. superreview adds them from the human's messages and the diff.
 - Never write the superreview marker, an \`Intent:\` commit trailer, or a \`*.superreview.md\` file, never edit \`.github/superreview/\`, and never sign for superreview or read its signing key. superreview blocks these commands.
-- The marker is good for one head only. After each push or rebase of a PR branch, run \`gh pr edit <n> --body-file <file>\` again, or the superreview CI check fails.
+- A signed marker is good for one diff. After a push that changes the diff (a new commit, a conflict fix, or a rebase onto changes next to the PR's lines), run \`gh pr edit <n> --body-file <file>\` again, or the superreview CI check fails; superreview tells you after the push. An unsigned marker is good for one head, so it needs this after every push.
 - If the check finds gaps, rewrite the body so that it is clear. Do not add an FAQ or answers at the end, and do not make it longer.
 - If the check says to ask the user, stop and ask the user. Do not retry first.`
 
@@ -121,14 +123,27 @@ async function privateKeyFile($: EngineInterface, cfg: Cfg): Promise<string | un
   )
 }
 
-// Signs the marker fields with ssh-keygen -Y sign. A key that needs a touch
-// (FIDO, Secure Enclave) waits for it: the human approves each signature.
+// The patch id of the diff from base to HEAD, which a signed marker names. A
+// cut diff would give a wrong id, so it gives none.
+async function diffId($: EngineInterface, cwd: string, base: string): Promise<string | undefined> {
+  const diff = await $.process.run(['git', ...PATCH_DIFF, base, 'HEAD'], { cwd })
+  if (diff.exitCode !== 0 || diff.isStdoutTruncated || diff.stdout === '') return undefined
+  const id = await $.process.run(['git', 'patch-id', '--stable'], { cwd, stdin: diff.stdout })
+
+  return id.exitCode === 0 ? patchId(id.stdout) : undefined
+}
+
+// Signs the marker fields with ssh-keygen -Y sign, over the diff (v3). A key
+// that needs a touch (FIDO, Secure Enclave) waits for it: the human approves
+// each signature.
 async function sign($: EngineInterface, cfg: Cfg, cwd: string, m: MarkerFields): Promise<MarkerFields | string> {
   const key = await signingKey($, cfg, cwd)
   if (key === undefined) return m
   const signer = (await run($, ['git', 'config', '--get', 'user.email'], cwd))?.trim()
   if (!signer) return 'git user.email is not set, and the signature names its signer by it'
-  const fields = { ...m, signer }
+  const diff = await diffId($, cwd, m.base)
+  if (diff === undefined) return 'git could not compute the patch id of the PR diff'
+  const fields = { ...m, signer, diff }
   const r = await $.process.run(['ssh-keygen', '-Y', 'sign', '-f', key, '-n', NAMESPACE], {
     cwd,
     stdin: signedPayload(fields),
@@ -291,30 +306,52 @@ async function gatePr($: EngineInterface, cfg: Cfg, command: string, next: (c: s
   return ran
 }
 
-// A push moves the PR head away from the head the marker was made for. Say so
-// in the push result, at once, instead of when CI fails.
+type ViewedPr = { number: number; body?: string; baseRefName: string; headRefName: string; headRefOid: string }
+
+// What the PR has now in place of what its marker names: the patch id of its
+// diff for a signed marker, else its head. Undefined when it cannot tell.
+async function nowFor($: EngineInterface, dir: string, pr: ViewedPr, signed: MarkerFields): Promise<string | undefined> {
+  const branch = (await run($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], dir))?.trim()
+  const isOwn = branch === pr.headRefName
+  if (signed.diff !== undefined) {
+    if (!isOwn) return undefined
+    const base = (await run($, ['git', 'merge-base', `origin/${pr.baseRefName}`, 'HEAD'], dir))?.trim()
+    return base ? diffId($, dir, base) : undefined
+  }
+  // GitHub can show the old head for a moment after a push: on the PR's own
+  // branch the local head is the one just pushed
+  const local = isOwn ? (await run($, ['git', 'rev-parse', 'HEAD'], dir))?.trim() : undefined
+
+  return local || pr.headRefOid
+}
+
+// A push can move the PR away from what its marker names. Say so in the push
+// result, at once, instead of when CI fails.
 async function afterPush($: EngineInterface, command: string, ran: Ran): Promise<Ran> {
   const push = parsePush(command)
   if (push === undefined || ran.deny !== undefined || ran.isError === true) return ran
   try {
     const dir = (await run($, ['pwd'], push.cwd))?.trim()
     if (dir === undefined) return ran
-    const view = await run($, ['gh', 'pr', 'view', '--json', 'number,body,headRefName,headRefOid'], dir)
+    const view = await run($, ['gh', 'pr', 'view', '--json', 'number,body,baseRefName,headRefName,headRefOid'], dir)
     if (view === undefined) return ran
-    const pr = JSON.parse(view) as { number: number; body?: string; headRefName: string; headRefOid: string }
-    const signedFor = markerHead(pr.body ?? '')
-    if (signedFor === undefined) return ran
-    // GitHub can show the old head for a moment after a push: on the PR's own
-    // branch the local head is the one just pushed
-    const branch = (await run($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], dir))?.trim()
-    const local = branch === pr.headRefName ? (await run($, ['git', 'rev-parse', 'HEAD'], dir))?.trim() : undefined
-    const head = local || pr.headRefOid
-    if (head === signedFor) {
+    const pr = JSON.parse(view) as ViewedPr
+    const signed = readMarker(pr.body ?? '')
+    if (signed === undefined) return ran
+    const kind = signed.diff === undefined ? ('head' as const) : ('diff' as const)
+    const was = signed.diff ?? signed.head
+    const now = await nowFor($, dir, pr, signed)
+    if (now === undefined) return ran
+    if (now === was) {
       await update($, stale, s => (s?.pr === pr.number ? null : s))
       return ran
     }
-    await update($, stale, () => ({ pr: pr.number, branch: pr.headRefName, marker: signedFor, head }))
-    const note = `superreview: PR #${pr.number} now has head ${head.slice(0, 12)}, but its marker was made for head ${signedFor.slice(0, 12)}. A push or a rebase always makes the marker out of date, and the superreview CI check fails until the loop runs again. Run \`gh pr edit ${pr.number} --body-file <your body file>\` now; the same body is fine if it still describes the diff.`
+    await update($, stale, () => ({ pr: pr.number, branch: pr.headRefName, kind, marker: was, now }))
+    const cause =
+      kind === 'diff'
+        ? `the diff of PR #${pr.number} changed since the loop (a new commit, a conflict fix, or a rebase onto changes next to its own lines)`
+        : `PR #${pr.number} now has head ${now.slice(0, 12)}, but its unsigned marker was made for head ${was.slice(0, 12)}`
+    const note = `superreview: ${cause}. The superreview CI check fails until the loop runs again. Run \`gh pr edit ${pr.number} --body-file <your body file>\` now; the same body is fine if it still describes the diff.`
 
     return { ...ran, context: [...(ran.context ?? []), note] }
   } catch {
@@ -545,7 +582,9 @@ export const register: Register = (on, options) => {
         <Box>
           <Text dimColor>superreview · </Text>
           <Text color="warning" wrap="truncate-end">
-            {`PR #${s.pr}: marker for ${s.marker.slice(0, 7)}, head is ${s.head.slice(0, 7)}. Run gh pr edit ${s.pr} --body-file <file>`}
+            {s.kind === 'diff'
+              ? `PR #${s.pr}: the diff changed since the loop. Run gh pr edit ${s.pr} --body-file <file>`
+              : `PR #${s.pr}: marker for ${s.marker.slice(0, 7)}, head is ${s.now.slice(0, 7)}. Run gh pr edit ${s.pr} --body-file <file>`}
           </Text>
         </Box>
       )
