@@ -8,6 +8,7 @@ import {
   INTENT_PROMPT,
   LABELS,
   marker,
+  markerHead,
   MERGE_PROMPT,
   NAMESPACE,
   normalize,
@@ -28,6 +29,7 @@ import {
   mentionsKey,
   parseCommit,
   parsePr,
+  parsePush,
   replaceBodyFile,
   tamperReason,
 } from './shell'
@@ -37,6 +39,7 @@ const pending = atom({ plugin: 'superreview', key: 'pending' } as const, [])
 // messages already used by a commit: context for a short "ok go" later
 const history = atom({ plugin: 'superreview', key: 'history' } as const, [])
 const loop = atom({ plugin: 'superreview', key: 'loop' } as const, null)
+const stale = atom({ plugin: 'superreview', key: 'stale' } as const, null)
 
 const HUMAN = new Set(['composer', 'bridge', 'sdk'])
 const MAX_PENDING_CHARS = 12_000
@@ -55,6 +58,7 @@ A reader with no context checks every PR body before \`gh pr create\` runs. It s
 - Keep your part under ${maxChars} characters.
 - Do not write the Intent or Reading map sections. superreview adds them from the human's messages and the diff.
 - Never write the superreview marker, an \`Intent:\` commit trailer, or a \`*.superreview.md\` file, never edit \`.github/superreview/\`, and never sign for superreview or read its signing key. superreview blocks these commands.
+- The marker is good for one head only. After each push or rebase of a PR branch, run \`gh pr edit <n> --body-file <file>\` again, or the superreview CI check fails.
 - If the check finds gaps, rewrite the body so that it is clear. Do not add an FAQ or answers at the end, and do not make it longer.
 - If the check says to ask the user, stop and ask the user. Do not retry first.`
 
@@ -203,7 +207,7 @@ async function prIntent($: EngineInterface, cfg: Cfg, ctx: Ctx): Promise<string>
 async function check($: EngineInterface, cfg: Cfg, pr: PrCommand | undefined, agent: string, title: string): Promise<Checked> {
   const ctx = await context($, pr)
   if (typeof ctx === 'string') return { kind: 'error', reason: ctx }
-  const body = composeBody(agent, await prIntent($, cfg, ctx), ctx.map)
+  const body = composeBody(agent, await prIntent($, cfg, ctx), ctx.map, ctx.head)
   const reply = await complete($, cfg.readerModel, readerPrompt(title, body, ctx.diff), READER_SYSTEM)
   const items = reply === undefined ? undefined : parseReader(reply)
   if (items === undefined) return { kind: 'error', reason: 'the reader gave no usable answer' }
@@ -279,11 +283,43 @@ async function gatePr($: EngineInterface, cfg: Cfg, command: string, next: (c: s
   const isCreated = ran.deny === undefined && ran.isError !== true
   await update($, loop, () => (isCreated ? after : current))
   if (isCreated) {
+    await update($, stale, s => (s?.branch === checked.ctx.branch ? null : s))
     const how = signed.sig === undefined ? 'not signed: no SSH signing key' : `signed as ${signed.signer}`
     $.ui.toast(`superreview: the PR passed the fresh reader in ${round} round${round === 1 ? '' : 's'}, ${how}`)
   }
 
   return ran
+}
+
+// A push moves the PR head away from the head the marker was made for. Say so
+// in the push result, at once, instead of when CI fails.
+async function afterPush($: EngineInterface, command: string, ran: Ran): Promise<Ran> {
+  const push = parsePush(command)
+  if (push === undefined || ran.deny !== undefined || ran.isError === true) return ran
+  try {
+    const dir = (await run($, ['pwd'], push.cwd))?.trim()
+    if (dir === undefined) return ran
+    const view = await run($, ['gh', 'pr', 'view', '--json', 'number,body,headRefName,headRefOid'], dir)
+    if (view === undefined) return ran
+    const pr = JSON.parse(view) as { number: number; body?: string; headRefName: string; headRefOid: string }
+    const signedFor = markerHead(pr.body ?? '')
+    if (signedFor === undefined) return ran
+    // GitHub can show the old head for a moment after a push: on the PR's own
+    // branch the local head is the one just pushed
+    const branch = (await run($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], dir))?.trim()
+    const local = branch === pr.headRefName ? (await run($, ['git', 'rev-parse', 'HEAD'], dir))?.trim() : undefined
+    const head = local || pr.headRefOid
+    if (head === signedFor) {
+      await update($, stale, s => (s?.pr === pr.number ? null : s))
+      return ran
+    }
+    await update($, stale, () => ({ pr: pr.number, branch: pr.headRefName, marker: signedFor, head }))
+    const note = `superreview: PR #${pr.number} now has head ${head.slice(0, 12)}, but its marker was made for head ${signedFor.slice(0, 12)}. A push or a rebase always makes the marker out of date, and the superreview CI check fails until the loop runs again. Run \`gh pr edit ${pr.number} --body-file <your body file>\` now; the same body is fine if it still describes the diff.`
+
+    return { ...ran, context: [...(ran.context ?? []), note] }
+  } catch {
+    return ran
+  }
 }
 
 // Intent trailer from the human's own messages since the last commit, with
@@ -441,10 +477,9 @@ export const register: Register = (on, options) => {
     if (kind === 'bypass') {
       return { deny: 'superreview: open or edit PRs with gh pr create/edit --body-file, so that the fresh reader can check the body.' }
     }
-    if (kind === 'pr') return gatePr($, cfg, e.command, pass)
-    if (kind === 'commit') return addIntent($, cfg, e.command, pass)
+    const ran = kind === 'pr' ? await gatePr($, cfg, e.command, pass) : kind === 'commit' ? await addIntent($, cfg, e.command, pass) : await next(e)
 
-    return next(e)
+    return afterPush($, e.command, ran)
   }).catch(($, e, next) =>
     next.called || classify(e.command) === 'other'
       ? next(e)
@@ -502,8 +537,19 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const l = await read($, loop)
-    if (l === null || e.props.hasSurvey) return next(e)
+    const s = await read($, stale)
+    if ((l === null && s === null) || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
+    const staleLine =
+      s === null ? null : (
+        <Box>
+          <Text dimColor>superreview · </Text>
+          <Text color="warning" wrap="truncate-end">
+            {`PR #${s.pr}: marker for ${s.marker.slice(0, 7)}, head is ${s.head.slice(0, 7)}. Run gh pr edit ${s.pr} --body-file <file>`}
+          </Text>
+        </Box>
+      )
+    if (l === null) return <Box flexDirection="column">{staleLine}</Box>
     const head =
       l.status === 'checking'
         ? 'reading…'
@@ -515,6 +561,7 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
+        {staleLine}
         <Box>
           <Text dimColor>superreview · </Text>
           <Text color={l.status === 'blocked' ? 'warning' : l.status === 'passed' ? 'success' : 'text'}>{head}</Text>

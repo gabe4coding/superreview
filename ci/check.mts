@@ -135,7 +135,7 @@ if (pr.draft === true) {
 
 const body: string = pr.body ?? ''
 const head: string = pr.head.sha
-const check = await verifyMarker(body, head, isStrictHead)
+const check = await verifyMarker(body, head, isStrictHead, String(pr.number))
 for (const n of check.notes) summary.push(`- ℹ️ ${n}`)
 if (check.problems.length > 0) {
   for (const p of check.problems) summary.push(`- ❌ ${p}`)

@@ -23,7 +23,17 @@ export function agentPart(body: string): string {
   return text.replace(MARKER, '').trim()
 }
 
-export function composeBody(agent: string, intent: string, map: string[]): string {
+// The head line tells a human reader, before CI does, that a push or a rebase
+// makes the marker out of date.
+export function composeBody(agent: string, intent: string, map: string[], head?: string): string {
+  const headLine =
+    head === undefined
+      ? []
+      : [
+          '',
+          `<sub>superreview checked this body for head \`${head.slice(0, 7)}\`. A push or a rebase changes the head: then run \`gh pr edit --body-file <file>\` again, or the superreview check fails.</sub>`,
+        ]
+
   return [
     agent,
     '',
@@ -37,6 +47,7 @@ export function composeBody(agent: string, intent: string, map: string[]): strin
     ...map.map(l => `- ${l}`),
     '',
     '<sub>Made by a deterministic script from the diff.</sub>',
+    ...headLine,
     END,
   ].join('\n')
 }
@@ -78,12 +89,19 @@ export const sigFromMarker = (b64: string) =>
 const MARKER_FIELDS =
   /^<!-- superreview:v([12]) head=([0-9a-f]*) base=([0-9a-f]*) body=sha256:([0-9a-f]{64}) rounds=(\d+) reader=([\w.-]+)(?: signer=([^\s<>]+) sig=([A-Za-z0-9+/=]+))? -->\s*$/gm
 
-export type MarkerCheck = { marker?: MarkerFields; isSigned: boolean; problems: string[]; notes: string[] }
+// The head the marker was made for, when the body has exactly one marker.
+export function markerHead(body: string): string | undefined {
+  const found = [...body.replace(/\r\n/g, '\n').matchAll(MARKER_FIELDS)]
+
+  return found.length === 1 ? found[0]![2] : undefined
+}
+
+export type MarkerCheck ={ marker?: MarkerFields; isSigned: boolean; problems: string[]; notes: string[] }
 
 // What CI holds the marker to, before any signature check. A v1 hash is no
 // signature (anyone can compute it): it only shows an edit after the loop. A
 // v2 marker is signed over the head too, so a later push always fails it.
-export async function verifyMarker(body: string, prHead: string, isStrictHead: boolean): Promise<MarkerCheck> {
+export async function verifyMarker(body: string, prHead: string, isStrictHead: boolean, prNumber = '<number>'): Promise<MarkerCheck> {
   const text = body.replace(/\r\n/g, '\n')
   const found = [...text.matchAll(MARKER_FIELDS)]
   const anyMarker = text.match(MARKER) ?? []
@@ -106,8 +124,12 @@ export async function verifyMarker(body: string, prHead: string, isStrictHead: b
     problems.push('The body changed after the review loop (hash mismatch). Change it through superreview: `gh pr edit --body-file <file>`.')
   }
   if (m.head !== prHead) {
-    const say = `Commits were pushed after the loop (marker head ${m.head.slice(0, 12) || 'none'}, PR head ${prHead.slice(0, 12)}).`
-    if (isStrictHead || isSigned) problems.push(`${say} Run the loop again: \`gh pr edit --body-file <file>\`.`)
+    const say = `The PR head changed after the loop, by a push or a rebase (marker head ${m.head.slice(0, 12) || 'none'}, PR head ${prHead.slice(0, 12)}).`
+    if (isStrictHead || isSigned) {
+      problems.push(
+        `${say} The marker is good for one head only. In Claude Code, run the loop again: \`gh pr edit ${prNumber} --body-file <file>\`. The same body is fine if it still describes the diff.`,
+      )
+    }
     else notes.push(`${say} The reader below checks the current diff.`)
   }
 

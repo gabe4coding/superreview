@@ -163,7 +163,20 @@ export function parseCommit(cmd: string): CommitCommand | undefined {
   return undefined
 }
 
-export const addTrailer = (cmd: string, commit: CommitCommand, intent: string) =>
+// git push, with the dir it runs in
+export function parsePush(cmd: string): { cwd?: string } | undefined {
+  let cwd: string | undefined
+
+  for (const w of words(cmd)) {
+    if (w[0] === 'cd' && w[1] !== undefined) cwd = w[1]
+    const sub = gitSub(w)
+    if (sub !== -1 && w[sub] === 'push') return { cwd: sub === 3 ? w[2] : cwd }
+  }
+
+  return undefined
+}
+
+export const addTrailer =(cmd: string, commit: CommitCommand, intent: string) =>
   `${cmd.slice(0, commit.end)} --trailer ${quote(`Intent: ${intent}`)}${cmd.slice(commit.end)}`
 
 export const INTENT_LINE = /(^|\n)\s*Intent\s*:/i

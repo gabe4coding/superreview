@@ -5,6 +5,7 @@ import {
   composeBody,
   INTENT_PROMPT,
   marker,
+  markerHead,
   normalize,
   parseReader,
   readerPrompt,
@@ -15,7 +16,7 @@ import {
   verifyMarker,
 } from '../hooks/body'
 import { parseChanges, readingMap } from '../hooks/readingMap'
-import { addTrailer, classify, fileTamperReason, mentionsKey, parseCommit, parsePr, replaceBodyFile, tamperReason } from '../hooks/shell'
+import { addTrailer, classify, fileTamperReason, mentionsKey, parseCommit, parsePr, parsePush, replaceBodyFile, tamperReason } from '../hooks/shell'
 
 test('parses gh pr create with a body file after cd', () => {
   const cmd = `cd svc && gh pr create --title "Add retry" --base develop --body-file /tmp/pr.md`
@@ -139,8 +140,23 @@ test('CI marker check', async () => {
 
   const pushed = await verifyMarker(signed, 'ccc', false)
   expect(pushed.problems).toEqual([])
-  expect(pushed.notes[0]).toContain('pushed after the loop')
-  expect((await verifyMarker(signed, 'ccc', true)).problems[0]).toContain('pushed after the loop')
+  expect(pushed.notes[0]).toContain('a push or a rebase')
+  const strict = (await verifyMarker(signed, 'ccc', true, '7')).problems[0]
+  expect(strict).toContain('a push or a rebase')
+  expect(strict).toContain('gh pr edit 7 --body-file')
+})
+
+test('the body names its head, and the marker gives it back', async () => {
+  const body = composeBody('## What and why\nX', 'Do X', ['**Size:** 1 files, +1 −0'], 'abcdef0123')
+  expect(body).toContain('checked this body for head `abcdef0`')
+  expect(agentPart(body)).toBe('## What and why\nX')
+  const hash = await sha256(normalize(body))
+  expect(markerHead(`${body}\n${marker({ head: 'abcdef0123', base: 'b', body: hash, rounds: 1, reader: 'sonnet' })}\n`)).toBe('abcdef0123')
+  expect(markerHead(body)).toBeUndefined()
+  expect(parsePush('git push --force-with-lease')).toEqual({ cwd: undefined })
+  expect(parsePush('cd svc && git push')).toEqual({ cwd: 'svc' })
+  expect(parsePush('git -C r push origin x')).toEqual({ cwd: 'r' })
+  expect(parsePush('echo git push')).toBeUndefined()
 })
 
 const ARMORED = `-----BEGIN SSH SIGNATURE-----
@@ -166,7 +182,7 @@ test('signed marker: the armor round trip, the payload and the v2 check', async 
   expect(ok.isSigned).toBe(true)
   expect(ok.marker).toMatchObject({ signer: 'a@b.c', sig })
   // a signed head is always strict: a later push needs the loop again
-  expect((await verifyMarker(signed, 'ccc', false)).problems[0]).toContain('pushed after the loop')
+  expect((await verifyMarker(signed, 'ccc', false)).problems[0]).toContain('a push or a rebase')
   const v1WithSig = signed.replace('superreview:v2', 'superreview:v1')
   expect((await verifyMarker(v1WithSig, 'aaa', false)).problems[0]).toContain('malformed')
 })

@@ -1,5 +1,7 @@
-import type { On } from 'claude-code'
+import type { On, RenderElement } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
+
+const BAND = { hasSurvey: false, isWorking: false, maxRows: 10 } as never
 
 const OK = { ok: true, gap: '' }
 const PASS = JSON.stringify({ what_why: OK, important: { ...OK, drift: [], breaking: [], irreversible: [] }, next_step: OK })
@@ -16,7 +18,6 @@ function world(on: On, reader: () => string, extra: Record<string, string> = {})
   const files: Record<string, string> = { '/repo/pr.md': BODY }
   const seen = { readerCalls: 0, written: '', ran: [] as string[], files, stdin: [] as string[] }
   const git: Record<string, string> = {
-    ...extra,
     pwd: '/repo\n',
     'git rev-parse --abbrev-ref HEAD': 'feat/retry\n',
     'git symbolic-ref --short refs/remotes/origin/HEAD': 'origin/main\n',
@@ -25,6 +26,7 @@ function world(on: On, reader: () => string, extra: Record<string, string> = {})
     'git diff --name-status -M base123 HEAD': 'M\tsrc/client.ts\n',
     'git diff --numstat -M base123 HEAD': '3\t1\tsrc/client.ts\n',
     'git diff --no-color -M base123 HEAD': 'diff --git a/src/client.ts b/src/client.ts\n+retry()\n',
+    ...extra,
   }
   const out = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 
@@ -46,6 +48,11 @@ function world(on: On, reader: () => string, extra: Record<string, string> = {})
   on('model.complete', ($, e) => {
     seen.readerCalls += 1
     return { value: { isAnswered: true as const, text: reader(), usage } }
+  })
+  // the engine's own band: an empty box
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return h(Box, {}) as RenderElement
   })
   on('tool.call', ($, e) => {
     if (e.tool === 'Bash') seen.ran.push(e.command)
@@ -158,6 +165,42 @@ test('an amend that replaces the message keeps the old Intent trailer', async ($
   expect(seen.ran).toEqual([`git commit --trailer 'Intent: Add retries to the payment client' --amend -m "better message"`])
   await $.tool.call({ tool: 'Bash', command: 'git commit -m "no messages yet"' })
   expect(seen.ran[1]).toBe('git commit -m "no messages yet"')
+})
+
+const MARKED = (head: string) =>
+  JSON.stringify({
+    number: 7,
+    headRefName: 'feat/retry',
+    headRefOid: 'aaa111',
+    body: `x\n<!-- superreview:v1 head=${head} base=bbb222 body=sha256:${'0'.repeat(64)} rounds=1 reader=sonnet -->\n`,
+  })
+const VIEW = 'gh pr view --json number,body,headRefName,headRefOid'
+// marker heads are hex
+const PUSHED = { 'git rev-parse HEAD': 'ccc333\n' }
+
+test('a push that moves the PR head says the marker is out of date', async ($, on) => {
+  world(on, () => PASS, { ...PUSHED, [VIEW]: MARKED('aaa111') })
+  const r = await $.tool.call({ tool: 'Bash', command: 'git push --force-with-lease' })
+  expect(r.deny).toBeUndefined()
+  // the note for the model is a result context, which a plugin's own
+  // $.tool.call does not get back: the band shows the same state
+  const ui = await $.ui.mount({ plugin: 'superreview', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ type: 'Text', text: /PR #7: marker for aaa111, head is ccc333\. Run gh pr edit 7/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a push that keeps the marked head adds nothing', async ($, on) => {
+  world(on, () => PASS, { ...PUSHED, [VIEW]: MARKED('ccc333') })
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  const ui = await $.ui.mount({ plugin: 'superreview', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ type: 'Text', text: /marker for/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the body says which head superreview checked', async ($, on) => {
+  const seen = world(on, () => PASS)
+  await $.tool.call({ tool: 'Bash', command: create })
+  expect(seen.written).toContain('checked this body for head `head456`')
 })
 
 test('a commit message file with an Intent line is refused', async ($, on) => {

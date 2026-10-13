@@ -14,8 +14,11 @@ export type Loop = {
   readingMap: string[]
 }
 
+// An open PR whose marker was made for an older head than the PR has now
+export type Stale = { pr: number; branch: string; marker: string; head: string }
+
 declare module 'claude-code' {
   interface PluginState {
-    superreview: { pending: string[]; history: string[]; loop: Loop | null }
+    superreview: { pending: string[]; history: string[]; loop: Loop | null; stale: Stale | null }
   }
 }
